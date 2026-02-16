@@ -1,0 +1,7 @@
+{
+	"name": "Python 3",
+	"image": "python:3.11-bookworm",
+	"runArgs": [
+    "--gpus", "all"
+]
+}
