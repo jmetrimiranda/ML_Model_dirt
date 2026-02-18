@@ -1,0 +1,5 @@
+outs:
+- md5: 69c58e86c92231429fc9eb13c56dc241
+  size: 492513
+  hash: md5
+  path: carregamento_2025.csv
