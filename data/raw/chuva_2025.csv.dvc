@@ -1,0 +1,5 @@
+outs:
+- md5: fc5b1c1d5d69c1a37d2c10f804b29d0a
+  size: 245320
+  hash: md5
+  path: chuva_2025.csv

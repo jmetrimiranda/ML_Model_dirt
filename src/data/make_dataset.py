@@ -6,6 +6,7 @@ Fontes de dados:
     - RAMPS: Meteorologia de alta frequência (~15min)
     - POLIGONOS: Emissões calculadas por polígono (~15min)
     - CARREGAMENTO: Dados de processo portuário (horário)
+    - CHUVA: Precipitação horária via Open-Meteo API
     - TARGET (Y): PESO DO FILTRO diário (coleta ~09:00)
 
 Autor: Jorge Metri / Claude (MLOps)
@@ -22,6 +23,53 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 RAW_DIR = Path("data/raw")
 PROCESSED_DIR = Path("data/processed")
+
+
+# ---------------------------------------------------------------------------
+# Coordenadas GPS (SIRGAS 2000) — fornecidas pelo usuário
+# ---------------------------------------------------------------------------
+COORDS_CONFIG = {
+    "Praia": {"lat": -20.7956661, "lon": -40.5816175},
+    "RAMP 4": {"lat": -20.78460, "lon": -40.58300},
+    "RAMP 5": {"lat": -20.78505, "lon": -40.58237},
+    "RAMP 6": {"lat": -20.78640, "lon": -40.58304},
+    "RAMP 8": {"lat": -20.78517, "lon": -40.58260},
+    "RAMP 9": {"lat": -20.78534, "lon": -40.57039},
+    "RAMP 10": {"lat": -20.78040, "lon": -40.57175},
+    "RAMP 11": {"lat": -20.78845, "lon": -40.57180},
+    "RAMP 13": {"lat": -20.77740, "lon": -40.58233},
+    "RAMP 14": {"lat": -20.77786, "lon": -40.58214},
+    "RAMP 15": {"lat": -20.77835, "lon": -40.58256},
+    "RAMP 16": {"lat": -20.77772, "lon": -40.58274},
+    "RAMP 17": {"lat": -20.77850, "lon": -40.58190},
+    "RAMP 18": {"lat": -20.78576, "lon": -40.58130},
+    "RAMP 19": {"lat": -20.77930, "lon": -40.57973},
+    "RAMP 20": {"lat": -20.77992, "lon": -40.57930},
+    "RAMP 21": {"lat": -20.78105, "lon": -40.58087},
+    "RAMP 22": {"lat": -20.78095, "lon": -40.58228},
+}
+
+
+def _calc_theta_praia() -> dict[str, float]:
+    """Calcula o ângulo θ de cada RAMP em direção à Praia (radianos).
+
+    θ_praia^i = arctan2(Lon_praia - Lon_i, Lat_praia - Lat_i)
+
+    Retorna dicionário {ramp_id: theta_rad}.
+    """
+    praia = COORDS_CONFIG["Praia"]
+    thetas = {}
+    for ramp_id, coord in COORDS_CONFIG.items():
+        if ramp_id == "Praia":
+            continue
+        delta_lon = praia["lon"] - coord["lon"]
+        delta_lat = praia["lat"] - coord["lat"]
+        thetas[ramp_id] = np.arctan2(delta_lon, delta_lat)
+    return thetas
+
+
+# Pré-calcular (constante geométrica)
+THETA_PRAIA = _calc_theta_praia()
 
 
 # ===================================================================
@@ -63,6 +111,10 @@ def clean_ramps(path: Path | None = None) -> pd.DataFrame:
     df["vento_u"] = -df["velocidade_vento"] * np.sin(direcao_rad)
     df["vento_v"] = -df["velocidade_vento"] * np.cos(direcao_rad)
 
+    # --- Direção PARA ONDE o vento vai (inverso da meteorológica) ---
+    # Necessário para calcular fluxo efetivo: cos(dir_vento_para - theta_praia)
+    df["direcao_vento_para_rad"] = direcao_rad + np.pi
+
     # --- Selecionar colunas finais ---
     cols_final = [
         "Data e Hora",
@@ -71,6 +123,7 @@ def clean_ramps(path: Path | None = None) -> pd.DataFrame:
         "velocidade_vento",
         "vento_u",
         "vento_v",
+        "direcao_vento_para_rad",
         "particulas_9m",
         "particulas_16m",
     ]
@@ -241,13 +294,27 @@ def clean_target(path: Path | None = None) -> pd.DataFrame:
 
 
 # ===================================================================
-# 5. CREATE ABT (Analytical Base Table)
+# 5. LOAD RAIN DATA
+# ===================================================================
+def load_rain(path: Path | None = None) -> pd.DataFrame:
+    """Carrega dados de chuva (gerados por get_rain_data.py)."""
+    if path is None:
+        path = RAW_DIR / "chuva_2025.csv"
+
+    df = pd.read_csv(path)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    return df
+
+
+# ===================================================================
+# 6. CREATE ABT (Analytical Base Table)
 # ===================================================================
 def create_abt(
     df_target: pd.DataFrame,
     df_ramps: pd.DataFrame,
     df_poly: pd.DataFrame,
     df_carreg: pd.DataFrame,
+    df_rain: pd.DataFrame,
 ) -> pd.DataFrame:
     """Cria a ABT diária unificando todas as fontes.
 
@@ -257,12 +324,14 @@ def create_abt(
         - RAMPS: média vetorial u,v; max de partículas
         - POLIGONOS: integral de Riemann (massa total emitida)
         - CARREGAMENTO: soma toneladas, moda produto, média H2O
+        - CHUVA: soma precipitação na janela
+        - GEOMETRIA: fluxo_efetivo = Σ(Emissao_i * cos(Vento_i - θ_praia_i))
     """
     HORA_COLETA = 9
-    DELTA_T_RAMPS_H = 0.25  # 15 minutos em horas
-    DELTA_T_POLY_H = 0.25
+    DELTA_T_POLY_H = 0.25  # 15 minutos em horas
 
     emission_cols = [c for c in df_poly.columns if c.startswith("emissao_")]
+    ramp_ids_with_coords = set(THETA_PRAIA.keys())
     records = []
 
     for _, row in df_target.iterrows():
@@ -296,6 +365,37 @@ def create_abt(
             poly_feats[massa_col] = poly_win[col].sum() * DELTA_T_POLY_H
 
         emissao_total = sum(poly_feats.values())
+
+        # --- FLUXO EFETIVO (Geometria Física) ---
+        # Para cada RAMP com coordenadas, calcular contribuição direcional
+        # Fluxo_Efetivo = Σ (vel_vento_i * cos(dir_vento_para_i - θ_praia_i))
+        # Ponderado pela velocidade — mede quanto vento "empurra" na direção da praia
+        fluxo_efetivo_soma = 0.0
+        n_contrib = 0
+        for ramp_id in ramp_ids_with_coords:
+            ramp_data = ramps_win[ramps_win["ramp_id"] == ramp_id]
+            if ramp_data.empty:
+                continue
+            theta = THETA_PRAIA[ramp_id]
+            # cos(dir_vento_para - theta_praia): +1 = vento direto para praia
+            contrib = (
+                ramp_data["velocidade_vento"]
+                * np.cos(ramp_data["direcao_vento_para_rad"] - theta)
+            ).mean()
+            if not np.isnan(contrib):
+                fluxo_efetivo_soma += contrib
+                n_contrib += 1
+
+        fluxo_efetivo = fluxo_efetivo_soma / n_contrib if n_contrib > 0 else np.nan
+
+        # Fluxo ponderado pela emissão total
+        fluxo_emissao = emissao_total * fluxo_efetivo if not np.isnan(fluxo_efetivo) else np.nan
+
+        # --- CHUVA: soma precipitação na janela ---
+        mask_rain = (df_rain["datetime"] >= t_ini) & (df_rain["datetime"] < t_fim)
+        rain_win = df_rain.loc[mask_rain]
+        precipitacao_total = rain_win["precipitacao_mm"].sum()
+        is_rainy = int(precipitacao_total > 0.1)
 
         # --- CARREGAMENTO: agregações na janela ---
         mask_c = (df_carreg["datetime"] >= t_ini) & (df_carreg["datetime"] < t_fim)
@@ -333,6 +433,12 @@ def create_abt(
             # Emissões (massa total em kg)
             **poly_feats,
             "emissao_total_kg": emissao_total,
+            # Geometria
+            "fluxo_efetivo": fluxo_efetivo,
+            "fluxo_emissao": fluxo_emissao,
+            # Chuva
+            "precipitacao_mm": precipitacao_total,
+            "is_rainy": is_rainy,
             # Carregamento
             "carreg_total_tmn": carreg_total,
             "is_loading": is_loading_any,
@@ -358,29 +464,33 @@ def create_abt(
 # ===================================================================
 def main():
     print("=" * 60)
-    print("ETL Pipeline — Fase 1")
+    print("ETL Pipeline — Fase 1 (v2: Geometria + Chuva)")
     print("=" * 60)
 
     # --- 1. Limpar cada fonte ---
-    print("\n[1/5] Limpando RAMPS...")
+    print("\n[1/6] Limpando RAMPS...")
     df_ramps = clean_ramps()
     print(f"       Shape: {df_ramps.shape}")
 
-    print("\n[2/5] Limpando POLIGONOS...")
+    print("\n[2/6] Limpando POLIGONOS...")
     df_poly = clean_poligonos()
     print(f"       Shape: {df_poly.shape}")
 
-    print("\n[3/5] Limpando CARREGAMENTO...")
+    print("\n[3/6] Limpando CARREGAMENTO...")
     df_carreg = clean_carregamento()
     print(f"       Shape: {df_carreg.shape}")
 
-    print("\n[4/5] Limpando TARGET...")
+    print("\n[4/6] Limpando TARGET...")
     df_target = clean_target()
     print(f"       Shape: {df_target.shape}")
 
+    print("\n[5/6] Carregando CHUVA...")
+    df_rain = load_rain()
+    print(f"       Shape: {df_rain.shape}")
+
     # --- 2. Construir ABT ---
-    print("\n[5/5] Construindo ABT...")
-    abt = create_abt(df_target, df_ramps, df_poly, df_carreg)
+    print("\n[6/6] Construindo ABT...")
+    abt = create_abt(df_target, df_ramps, df_poly, df_carreg, df_rain)
 
     # --- 3. Salvar ---
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
