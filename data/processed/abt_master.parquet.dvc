@@ -1,0 +1,5 @@
+outs:
+- md5: a446f7dea375a25f57648da89b0c9a9e
+  size: 56692
+  hash: md5
+  path: abt_master.parquet
