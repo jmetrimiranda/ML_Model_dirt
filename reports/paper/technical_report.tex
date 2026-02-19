@@ -1,0 +1,1409 @@
+% ============================================================================
+% TECHNICAL REPORT — Predição de Sujidade em Praia (Mineração)
+% Autor: Jorge Metri
+% Gerado: 2026-02-18
+% ============================================================================
+\documentclass[12pt, a4paper]{article}
+
+% --- Pacotes ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{longtable}
+
+\geometry{margin=2.5cm}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!60!black
+}
+
+\sisetup{
+    output-decimal-marker = {,},
+    group-separator = {.},
+    group-minimum-digits = 4
+}
+
+% --- Comandos personalizados ---
+\newcommand{\feature}[1]{\texttt{#1}}
+\newcommand{\arquivo}[1]{\texttt{#1}}
+\newcommand{\abt}{ABT}
+\newcommand{\mae}{\text{MAE}}
+\newcommand{\rmse}{\text{RMSE}}
+
+\title{%
+    \textbf{Predição de Sujidade em Praia por Mineração:} \\[0.5em]
+    \Large Engenharia Física de Features em Regime de Small Data \\[0.3em]
+    \large Relatório Técnico Completo — Pipeline ETL, EDA e Modelagem SOTA
+}
+\author{
+    Jorge Metri \\
+    \small Projeto MLOps — Predição de Deposição de Particulados
+}
+\date{Fevereiro 2026}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+% SEÇÃO 1: ABSTRACT & RESUMO EXECUTIVO
+% ============================================================================
+\section{Abstract \& Resumo Executivo}
+\label{sec:abstract}
+
+\subsection{Contexto do Problema}
+
+A operação de mineração e embarque portuário gera emissões de material
+particulado que se depositam em praias adjacentes. O monitoramento é realizado
+por filtros gravimétricos com coleta diária, produzindo uma série temporal de
+\feature{PESO DO FILTRO} (em gramas) — a variável-alvo deste estudo. O desafio
+central reside na predição acurada dessa variável integrando dados heterogêneos
+de múltiplas fontes com frequências distintas (sub-horária, horária e diária)
+em um regime severo de \textbf{Small Data}: apenas 316 amostras válidas ao
+longo de um ano completo de operação (2025).
+
+\subsection{A Tese: Engenharia Física Supera Complexidade Algorítmica}
+
+Este relatório demonstra que, em regimes de Small Data com distribuição
+Gamma de cauda longa, a \textbf{engenharia de features fundamentada na
+física do transporte de partículas} é o fator dominante de performance
+preditiva — superando tanto a otimização exaustiva de hiperparâmetros
+(Optuna, 100 trials) quanto arquiteturas neurais de fronteira (KAN,
+MLP).
+
+\subsection{Resultados Principais}
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Compressão de dados:} 687.220 registros brutos (4 fontes,
+          3 frequências) $\rightarrow$ 316 linhas $\times$ 33 colunas na
+          \abt{} diária.
+    \item \textbf{Modelo campeão:} XGBoost Baseline com Pseudo-Huber Loss —
+          $\mae = \SI{0,0499}{\gram}$ ($-21{,}3\%$ vs.\ Dummy).
+    \item \textbf{Optuna (100 trials):} $\mae = \SI{0,0501}{\gram}$ — ganho
+          marginal de $+\SI{0,0002}{\gram}$, dentro do ruído estatístico.
+    \item \textbf{KAN} $[39 \to 16 \to 1]$: $\mae = \SI{0,0918}{\gram}$
+          ($-44{,}8\%$ \textit{pior} que o Dummy). Diagnóstico:
+          overparametrização crítica (ratio parâmetros:amostras = 30:1).
+    \item \textbf{Feature dominante:} \feature{fluxo\_efetivo\_lag1}
+          ($r = 0{,}48$ com o target) — a ``memória de 24h'' do sistema
+          de deposição gravitacional.
+\end{itemize}
+
+\subsection{Estrutura do Relatório}
+
+A Seção~\ref{sec:data_audit} apresenta a auditoria completa de saúde dos
+dados brutos. A Seção~\ref{sec:math} formaliza a unificação matemática do
+ETL. A Seção~\ref{sec:eda} percorre as 15 figuras da análise exploratória.
+A Seção~\ref{sec:physics_model} detalha a engenharia de features
+physics-informed. A Seção~\ref{sec:benchmark} apresenta o benchmark
+comparativo. A Seção~\ref{sec:conclusion} conclui com viabilidade de deploy
+e próximos passos.
+
+\newpage
+% ============================================================================
+% SEÇÃO 2: AUDITORIA DE SAÚDE DOS DADOS
+% ============================================================================
+\section{Auditoria de Saúde dos Dados}
+\label{sec:data_audit}
+
+A qualidade dos dados é o alicerce de qualquer pipeline de Machine Learning.
+Nesta seção, diagnosticamos cada uma das cinco fontes de dados brutas,
+identificamos os ``venenos'' (erros que propagam viés silenciosamente) e
+justificamos as decisões de tratamento adotadas.
+
+% ----------------------------------------------------------------------------
+\subsection{RAMPs — Meteorologia de Alta Frequência}
+\label{subsec:ramps}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — RAMPs}
+\label{tab:ramps_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/raw/ramps\_2025.csv} \\
+Volume                   & 531.554 registros $\times$ 13 colunas \\
+Frequência               & 15 minutos \\
+Período                  & 2025-01-01 00:07 a 2025-12-31 23:52 \\
+Múltiplas estações       & Sim (coluna \feature{Origem\_Arquivo}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Diagnóstico de Nulos por Sensor}
+
+A Tabela~\ref{tab:ramps_nulos} revela uma hierarquia clara de disponibilidade.
+Os sensores a 10,0m — considerados \textit{padrão ouro} pela WMO para medições
+de vento de superfície — apresentam $\approx 73\%$ de nulos. Paradoxalmente,
+são os mais confiáveis quando disponíveis, pois estão na altura padronizada
+e livres de interferência de edificações.
+
+\begin{table}[H]
+\centering
+\caption{Diagnóstico de nulos — sensores RAMPs}
+\label{tab:ramps_nulos}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Sensor} & \textbf{Nulos (\%)} & \textbf{Decisão ETL} \\
+\midrule
+Partículas [\si{\micro\gram/\metre^3}] 10,0m & 94,0 & Descartada \\
+VelocidadeVento [\si{\metre/\second}] 6,0m   & 91,6 & Fallback (secundário) \\
+DireçãoVento [\si{\degree}] 6,0m              & 91,6 & Fallback (secundário) \\
+Partículas [\si{\micro\gram/\metre^3}] 2,0m   & 85,8 & Descartada \\
+Partículas [\si{\micro\gram/\metre^3}] 6,0m   & 85,8 & Descartada \\
+DireçãoVento [\si{\degree}] 10,0m             & 72,9 & \textbf{Padrão ouro (primário)} \\
+VelocidadeVento [\si{\metre/\second}] 10,0m   & 72,7 & \textbf{Padrão ouro (primário)} \\
+Partículas [\si{\micro\gram/\metre^3}] 3,0m   & 23,2 & Utilizável \\
+Partículas [\si{\micro\gram/\metre^3}] 16,0m  & 23,2 & \textbf{Utilizada} \\
+Partículas [\si{\micro\gram/\metre^3}] 9,0m   & 17,2 & \textbf{Utilizada (melhor cobertura)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Outliers Físicos}
+
+Dois outliers merecem atenção:
+
+\begin{itemize}
+    \item \textbf{Partículas 10,0m:} máximo = \SI{4416}{\micro\gram/\metre^3}.
+          O valor típico ambiente é $< \SI{150}{\micro\gram/\metre^3}$. Este
+          ponto pode indicar uma tempestade de poeira localizada ou falha de
+          sensor. Como o sensor de 10,0m foi descartado (94\% NaN), o impacto
+          é nulo.
+    \item \textbf{VelocidadeVento 10,0m:} máximo = \SI{23,3}{\metre/\second}
+          ($\approx$ \SI{84}{\kilo\metre/\hour}). Valor plausível para região
+          costeira tropical em eventos de frente fria. Mantido no dataset.
+\end{itemize}
+
+\subsubsection{Tratamento SOTA Adotado}
+
+\begin{enumerate}
+    \item \textbf{Vento:} Sensor de 10,0m como primário. Se NaN, imputar com
+          sensor de 6,0m (fallback hierárquico). Caso ambos sejam NaN, manter
+          como valor ausente — o XGBoost trata nativamente via splits
+          direcionais.
+    \item \textbf{Partículas:} Utilizar sensores de 9,0m e 16,0m (melhor
+          cobertura: 82,8\% e 76,8\% respectivamente). Descartar 10,0m (94\%
+          NaN), 2,0m e 6,0m (85,8\% NaN).
+    \item \textbf{Engenharia vetorial imediata:} Converter direção (graus)
+          $\to$ radianos $\to$ componentes $u, v$ \textit{no momento do
+          carregamento}. Proibida qualquer média aritmética de ângulos em
+          graus (ver Seção~\ref{subsec:vetorial}).
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Polígonos — Emissões Industriais}
+\label{subsec:poligonos}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — Polígonos}
+\label{tab:poly_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/raw/poligonos\_2025.csv} \\
+Volume                   & 138.144 registros $\times$ 3 colunas \\
+Frequência               & 15 minutos \\
+Período                  & 2025-01-01 00:07 a 2025-12-31 23:52 \\
+Origens de emissão       & 5 (Torre C3, Usina 3, Usina 4, Pier, Pátio) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Venenos Identificados}
+
+\begin{enumerate}
+    \item \textbf{Leading whitespace no nome da coluna:} A coluna de emissão
+          aparece como \texttt{\ Particulas [kg/h] 0.0 m} (com espaço
+          inicial). Um \texttt{df.columns.str.strip()} resolve, mas a falha
+          em detectá-lo causa \texttt{KeyError} silencioso em pipelines
+          automatizados.
+
+    \item \textbf{Inconsistência de nomes das origens:} ``Usina3'' (sem espaço)
+          vs.\ ``Usina 4'' (com espaço). Sem normalização, a pivotagem
+          gera colunas duplicadas ou mal-alinhadas.
+
+    \item \textbf{Vírgula como separador decimal:} Em algumas versões do
+          dataset, valores numéricos aparecem como strings com vírgula
+          (ex: ``1,09''). Sem casting preventivo, a coluna permanece como
+          \texttt{object} e operações numéricas falham silenciosamente.
+
+    \item \textbf{Cobertura real:} 138k registros de 175k esperados (79\%).
+          Lacunas de cobertura concentradas em fontes específicas.
+\end{enumerate}
+
+\subsubsection{Tratamento SOTA Adotado}
+
+\begin{enumerate}
+    \item \texttt{str.strip()} em todos os nomes de coluna.
+    \item Normalização de origens via dicionário de mapeamento.
+    \item Casting preventivo: \texttt{str.replace(',', '.')} $\to$
+          \texttt{pd.to\_numeric()}.
+    \item Pivotagem: formato Long $\to$ Wide (1 coluna por origem).
+    \item Imputação: polígono ausente em timestamp específico $= 0{,}0$
+          (sem emissão calculada). NaN somente se \textit{todos} os polígonos
+          estiverem vazios (falha sistêmica).
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Carregamento — Processo Portuário}
+\label{subsec:carregamento}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — Carregamento}
+\label{tab:carreg_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/raw/carregamento\_2025.csv} \\
+Volume                   & 8.762 registros $\times$ 11 colunas \\
+Frequência               & Horária \\
+Período                  & 2024-12-31 23:00 a 2026-01-01 00:00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Veneno \#1: H\textsubscript{2}O (\%) — Outliers Fisicamente Impossíveis}
+
+\begin{table}[H]
+\centering
+\caption{Estatísticas descritivas — H\textsubscript{2}O (\%)}
+\label{tab:h2o_stats}
+\begin{tabular}{@{}lS[table-format=3.2]@{}}
+\toprule
+\textbf{Estatística} & \textbf{Valor (\%)} \\
+\midrule
+Mínimo    & 0,80 \\
+Média     & 5,52 \\
+Máximo    & 275,00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Três registros apresentam H\textsubscript{2}O $> 100\%$ — fisicamente
+impossível para umidade de minério. A causa provável é erro de digitação
+com deslocamento de vírgula decimal ($2{,}75 \to 275$). O tratamento
+adotado é o \textbf{clamping físico}: valores $> 25\% \to$ NaN. O limiar
+de 25\% é conservador: minérios de ferro típicos apresentam umidade entre
+2\% e 12\%; valores acima de 25\% indicam anomalia instrumental ou de
+registro.
+
+\subsubsection{Veneno \#2: Vírgula Decimal como String}
+
+Duas colunas críticas são armazenadas como \texttt{object} (texto) por
+conterem vírgula como separador decimal:
+
+\begin{itemize}
+    \item \feature{Finos -6,3mm (\%)} — ex: ``12,5'' em vez de 12.5
+    \item \feature{Tempo Estoque (dias)} — ex: ``3,2'' em vez de 3.2
+\end{itemize}
+
+O casting \texttt{str.replace(',', '.')} $\to$ \texttt{pd.to\_numeric()} é
+obrigatório antes de qualquer agregação.
+
+\subsubsection{Veneno \#3: Esparsidade Operacional (Zeros Estruturais)}
+
+\begin{table}[H]
+\centering
+\caption{Esparsidade operacional — Carregamento}
+\label{tab:carreg_sparse}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Variável}         & \textbf{Zeros / Nulos (\%)} \\
+\midrule
+Carregamento (TMN)         & 54,0\% (zeros — sem navio) \\
+Descarga Pet Coke          & 92,8\% (evento raro) \\
+Descarga Calcário          & 96,5\% (evento raro) \\
+Produto                    & 49,3\% (nulos estruturais) \\
+H\textsubscript{2}O (\%)  & 48,9\% (nulos estruturais) \\
+Finos (\%)                 & 66,4\% (nulos estruturais) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Interpretação:} Os nulos não são falhas de sensor — são
+\textit{zeros estruturais}. Horas sem navio atracado simplesmente não
+geram dados de qualidade de minério (H\textsubscript{2}O, Produto,
+Tempo Estoque). Tratar esses nulos com preenchimento zero criaria um
+viés grave: H\textsubscript{2}O = 0 sugeriria ``minério extremamente
+seco'', quando na realidade não há minério sendo processado.
+
+\subsubsection{A Cura: Estratégia de Imputação ``Carregamento Zero'' (SOTA)}
+
+A solução em três ações preserva a semântica física dos dados:
+
+\begin{description}
+    \item[Ação 1 — Flag binária:] Criar \feature{is\_loading}
+          ($= 1$ se Carregamento $> 0$, senão $0$). O modelo aprende a
+          distinguir regimes operacionais (navio presente vs.\ ausente).
+
+    \item[Ação 2 — Produto:] Preencher nulos com a categoria
+          \texttt{'NO\_OP'} (``nenhuma operação''). Preserva a natureza
+          categórica sem injetar informação falsa.
+
+    \item[Ação 3 — H\textsubscript{2}O e Tempo Estoque:] Preencher com
+          \textbf{Rolling Median (janela de 7 dias)} ou Mediana Global do
+          Mês.
+\end{description}
+
+\paragraph{Justificativa física da Rolling Median.}
+Quando não há navio, o minério estocado no pátio \textit{não desaparece}.
+Suas propriedades físicas (umidade, granulometria, tempo de estocagem)
+permanecem no ``estado basal'' da pilha. A mediana rolante de 7 dias captura
+esse estado sem ser sensível a outliers pontuais — ao contrário da média,
+que seria distorcida pelos valores extremos de H\textsubscript{2}O = 275\%.
+A escolha de 7 dias reflete o ciclo operacional típico de chegada de navios,
+garantindo que o valor imputado represente o contexto temporal correto.
+
+% ----------------------------------------------------------------------------
+\subsection{Chuva — Precipitação (Open-Meteo)}
+\label{subsec:chuva}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — Chuva}
+\label{tab:chuva_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/raw/chuva\_2025.csv} \\
+Volume                   & 8.760 registros $\times$ 3 colunas \\
+Frequência               & Horária \\
+Período                  & 2025-01-01 00:00 a 2025-12-31 23:00 \\
+Nulos                    & 0 (fonte externa confiável) \\
+Zero-inflated            & 75,8\% das horas $= \SI{0,0}{\milli\metre}$ \\
+Máximo                   & \SI{16,5}{\milli\metre/\hour} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Diagnóstico}
+
+Os dados de precipitação (API Open-Meteo) são a fonte mais limpa do
+pipeline: zero nulos, cobertura completa (365 $\times$ 24 = 8.760 horas)
+e consistência numérica perfeita. A única anomalia é a redundância entre
+as colunas \feature{precipitacao\_mm} e \feature{chuva\_mm}, que são
+idênticas. Uma foi removida no ETL.
+
+A distribuição \textbf{zero-inflated} (75,8\% das horas sem chuva) é
+característica de regiões costeiras tropicais com sazonalidade marcada.
+O máximo de \SI{16,5}{\milli\metre/\hour} corresponde a um evento de chuva
+forte, consistente com episódios convectivos da região.
+
+% ----------------------------------------------------------------------------
+\subsection{Target (Y) — Peso do Filtro}
+\label{subsec:target}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — Target}
+\label{tab:target_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/raw/y\_2025.csv} \\
+Volume                   & 365 registros $\times$ 3 colunas \\
+Frequência               & Diária \\
+Colunas                  & \feature{Data}, \feature{PESO DO FILTRO}, \feature{CLASSE DO FILTRO} \\
+Nulos no target          & 47/365 (12,9\%) — dias sem coleta \\
+Nulos em classe          & 75/365 (20,5\%) — validação apenas \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Distribuição do Target}
+
+\begin{table}[H]
+\centering
+\caption{Estatísticas descritivas — PESO DO FILTRO (g)}
+\label{tab:target_stats}
+\begin{tabular}{@{}lS[table-format=1.3]@{}}
+\toprule
+\textbf{Estatística} & \textbf{Valor (g)} \\
+\midrule
+Mínimo      & 0,000 \\
+Q25         & 0,000 \\
+Mediana     & 0,010 \\
+Média       & 0,053 \\
+Q75         & 0,050 \\
+Máximo      & 1,050 \\
+Desvio Padrão & 0,111 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A distribuição apresenta características de uma \textbf{distribuição Gamma
+com cauda longa}: baseline próximo a zero ($Q_{75} = \SI{0,050}{\gram}$),
+média superior à mediana (assimetria positiva) e 11 dias com peso $>
+\SI{0,3}{\gram}$ (3,5\% — eventos extremos). Essa morfologia tem
+consequências diretas para a escolha da função de perda:
+
+\begin{itemize}
+    \item \textbf{MSE (Mean Squared Error)} penalizaria excessivamente os
+          picos, distorcendo o aprendizado em direção aos outliers.
+    \item \textbf{MAE (Mean Absolute Error)} é a métrica natural para
+          distribuições assimétricas, pois pondera linearmente todos os
+          resíduos.
+    \item \textbf{Pseudo-Huber Loss} combina robustez a outliers com
+          diferenciabilidade — a escolha adotada neste trabalho.
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\subsection{ABT Final (Pós-ETL)}
+\label{subsec:abt}
+
+\begin{table}[H]
+\centering
+\caption{Ficha técnica — ABT de Modelagem}
+\label{tab:abt_ficha}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Atributo}       & \textbf{Valor} \\
+\midrule
+Arquivo                  & \arquivo{data/processed/abt\_modeling.parquet} \\
+Shape                    & 316 linhas $\times$ 33 colunas \\
+Nulos residuais          & Apenas \feature{classe\_filtro}: 29 NaN (9,2\%) \\
+Taxa de compressão       & 687k registros $\to$ 316 linhas diárias \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A conversão segue o pipeline: 365 dias (ano) $\to$ 318 (remoção de dias sem
+target) $\to$ 316 (perda de 2 linhas pela criação de lags temporais). A
+\abt{} final possui \textbf{zero nulos em todas as features preditivas} —
+os 29 NaN residuais estão exclusivamente na coluna \feature{classe\_filtro},
+utilizada apenas para validação estratificada, nunca como feature de entrada.
+
+\newpage
+% ============================================================================
+% SEÇÃO 3: UNIFICAÇÃO MATEMÁTICA (ETL RIGOROSO)
+% ============================================================================
+\section{Unificação Matemática — ETL Rigoroso}
+\label{sec:math}
+
+O desafio central do ETL é unificar quatro fontes de dados com frequências
+heterogêneas (15 min, horária, diária) em uma representação diária
+fisicamente coerente. Esta seção formaliza a matemática de cada etapa.
+
+% ----------------------------------------------------------------------------
+\subsection{Janela de Integração de 24 Horas}
+\label{subsec:janela}
+
+O filtro gravimétrico acumula partículas continuamente. A coleta ocorre
+diariamente entre 08:00 e 09:00, com 09:00 adotado como referência fixa.
+Para cada dia $D$ com target válido, a janela de integração é:
+
+\begin{equation}
+    \boxed{W_D = \left[D_{-1} \text{ 09:00},\; D \text{ 09:00}\right]}
+    \label{eq:janela}
+\end{equation}
+
+Todos os registros dentro de $W_D$ — independentemente de sua frequência
+original — são agregados em uma única linha da \abt{}. Essa definição
+garante que cada observação do target corresponde \textit{exatamente} ao
+acúmulo de 24 horas de processos físicos, meteorológicos e operacionais.
+
+\paragraph{Implicação para os lags.} A janela de $D$ termina às 09:00 de
+$D$ e a de $D-1$ termina às 09:00 de $D-1$. Portanto, \feature{lag1}
+refere-se à janela $W_{D-1}$ — as condições do dia anterior completo.
+
+% ----------------------------------------------------------------------------
+\subsection{Integral de Riemann para Massa de Emissão}
+\label{subsec:riemann}
+
+Os Polígonos reportam taxa de emissão em \si{kg/h} a cada 15 minutos.
+Para obter a massa total emitida na janela de 24h, aplicamos a integral
+de Riemann discreta:
+
+\begin{equation}
+    M_{\text{total}} = \sum_{t \in W_D} \text{Taxa}(t) \times \Delta t
+    \label{eq:riemann}
+\end{equation}
+
+onde:
+\begin{itemize}[noitemsep]
+    \item $\text{Taxa}(t)$ = taxa de emissão de partículas [\si{kg/h}] no
+          timestamp $t$;
+    \item $\Delta t = 0{,}25\text{h}$ (intervalo de 15 minutos convertido
+          para horas);
+    \item $M_{\text{total}}$ = massa total emitida em \si{kg} no período de
+          24h.
+\end{itemize}
+
+O cálculo é realizado \textbf{separadamente} para cada uma das 5 origens
+de emissão:
+
+\begin{equation}
+    M_{\text{total}} = \underbrace{M_{\text{Torre C3}}}_{
+        \feature{massa\_torre\_c3}} +
+    \underbrace{M_{\text{Usina 3}}}_{
+        \feature{massa\_usina3}} +
+    \underbrace{M_{\text{Usina 4}}}_{
+        \feature{massa\_usina4}} +
+    \underbrace{M_{\text{Pier}}}_{
+        \feature{massa\_pier}} +
+    \underbrace{M_{\text{Pátio}}}_{
+        \feature{massa\_patio}}
+    \label{eq:massa_fontes}
+\end{equation}
+
+A soma gera a coluna \feature{emissao\_total\_kg}, que representa a
+carga total de partículas injetada na atmosfera ao longo de 24 horas.
+
+% ----------------------------------------------------------------------------
+\subsection{Decomposição Vetorial do Vento}
+\label{subsec:vetorial}
+
+\subsubsection{O Erro Fatal da Média Aritmética de Ângulos}
+
+A direção do vento em graus é uma variável \textbf{circular}: 0\textdegree{} e 360\textdegree{}
+representam a mesma direção (Norte). A média aritmética de graus produz
+resultados fisicamente absurdos. Exemplo:
+
+\begin{equation*}
+    \text{Média aritmética de } 350{^\circ} \text{ e } 10{^\circ} =
+    \frac{350 + 10}{2} = 180{^\circ} \quad \text{(\textbf{Sul} --- errado!)}
+\end{equation*}
+
+O resultado correto é $0{^\circ}$ (Norte), pois ambas as medições estão próximas
+do Norte. Este erro propaga-se para todas as features derivadas (fluxo
+efetivo, geometria direcional) e \textbf{invalida completamente} qualquer
+modelo que as utilize.
+
+\subsubsection{A Solução: Componentes $u, v$}
+
+A decomposição vetorial converte o ângulo circular em duas grandezas
+escalares cuja média aritmética é válida:
+
+\begin{align}
+    u &= -V \cdot \sin\!\left(\frac{\pi \cdot \theta}{180}\right)
+    \label{eq:u_component} \\[6pt]
+    v &= -V \cdot \cos\!\left(\frac{\pi \cdot \theta}{180}\right)
+    \label{eq:v_component}
+\end{align}
+
+onde:
+\begin{itemize}[noitemsep]
+    \item $V$ = velocidade do vento [\si{\metre/\second}] a 10,0m;
+    \item $\theta$ = direção do vento [\si{\degree}] a 10,0m (convenção
+          meteorológica: de onde o vento sopra);
+    \item $u$ = componente zonal (leste-oeste);
+    \item $v$ = componente meridional (norte-sul).
+\end{itemize}
+
+\paragraph{Convenção de sinais.} O sinal negativo em ambas as equações
+reflete a convenção meteorológica: $\theta$ indica a direção \textit{de
+onde} o vento sopra. Um vento de Norte ($\theta = 0{^\circ}$) tem $u = 0$ e
+$v = -V$ (sopra para o Sul), consistente com a orientação geográfica.
+
+\subsubsection{Agregação Diária}
+
+A agregação na janela de 24h calcula as médias aritméticas $\bar{u}$ e
+$\bar{v}$ — operação válida por serem grandezas escalares, não angulares.
+A direção média reconstituída é:
+
+\begin{equation}
+    \bar{\theta} = \text{arctan2}(-\bar{u},\; -\bar{v}) \times
+    \frac{180}{\pi}
+    \label{eq:dir_media}
+\end{equation}
+
+Adicionalmente, a agregação produz:
+\begin{itemize}[noitemsep]
+    \item \feature{vento\_vel\_mean}: média de $V$ na janela (intensidade
+          média do transporte eólico);
+    \item \feature{vento\_vel\_max}: máximo de $V$ na janela (rajada —
+          proxy de ressuspensão máxima).
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\subsection{Agregação do Carregamento}
+\label{subsec:agreg_carreg}
+
+Para a tabela de Carregamento (frequência horária), a agregação na janela
+de 24h produz:
+
+\begin{equation}
+    \begin{aligned}
+    \feature{carreg\_total\_tmn} &= \sum_{t \in W_D}
+        \text{Carregamento}(t) \quad \text{[\si{TMN}]} \\[4pt]
+    \feature{is\_loading} &= \mathbb{1}\!\left[
+        \feature{carreg\_total\_tmn} > 0\right] \\[4pt]
+    \feature{h2o\_media} &= \overline{\text{H}_2\text{O}}_{\,W_D}
+        \quad \text{(valores imputados)} \\[4pt]
+    \feature{produto\_moda} &= \text{Moda}\!\left(
+        \text{Produto}_{W_D}\right) \text{ ou } \texttt{'NO\_OP'}
+    \end{aligned}
+    \label{eq:carreg_agreg}
+\end{equation}
+
+A feature \feature{is\_loading} funciona como um \textit{switch} de regime
+operacional: o modelo aprende padrões distintos para dias com e sem
+operação de embarque.
+
+% ----------------------------------------------------------------------------
+\subsection{Agregação da Precipitação}
+\label{subsec:agreg_chuva}
+
+Para a tabela de Chuva (frequência horária, Open-Meteo):
+
+\begin{equation}
+    \begin{aligned}
+    \feature{precipitacao\_mm} &= \sum_{t \in W_D}
+        P(t) \quad \text{[\si{\milli\metre}]} \\[4pt]
+    \feature{is\_rainy} &= \mathbb{1}\!\left[
+        \feature{precipitacao\_mm} > \tau\right]
+    \end{aligned}
+    \label{eq:chuva_agreg}
+\end{equation}
+
+onde $\tau$ é um limiar de precipitação que discrimina dias
+operacionalmente ``secos'' de dias com efeito de \textit{washout}
+significativo.
+
+% ----------------------------------------------------------------------------
+\subsection{Resumo da Compressão Dimensional}
+\label{subsec:compressao}
+
+A Tabela~\ref{tab:compressao} sintetiza a redução dimensional realizada
+pelo ETL.
+
+\begin{table}[H]
+\centering
+\caption{Compressão dimensional — fontes brutas $\to$ \abt{}}
+\label{tab:compressao}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Fonte} & \textbf{Registros} & \textbf{Freq.} &
+    \textbf{Colunas} & \textbf{Contrib.\ \abt{}} \\
+\midrule
+RAMPs          & 531.554 & 15 min  & 13 & $u, v$, vel, partículas \\
+Polígonos      & 138.144 & 15 min  & 3  & 5 massas + total \\
+Carregamento   & 8.762   & Horária & 11 & TMN, H$_2$O, estoque, flag \\
+Chuva          & 8.760   & Horária & 3  & precip., flag chuva \\
+Target         & 365     & Diária  & 3  & peso do filtro \\
+\midrule
+\textbf{Total bruto} & \textbf{687.585} & --- & --- &
+    \textbf{316 linhas $\times$ 33 cols} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A taxa de compressão é de $\approx 2.176:1$ em registros, preservando
+toda a informação física relevante através das agregações descritas
+nesta seção.
+
+\newpage
+% ============================================================================
+% SEÇÃO 4: EXPLORATORY DATA ANALYSIS (EDA)
+% ============================================================================
+\section{Exploratory Data Analysis (EDA)}
+\label{sec:eda}
+
+A análise exploratória percorre 15 figuras organizadas em três eixos:
+(i)~caracterização do target e regimes operacionais,
+(ii)~validação das hipóteses físicas de transporte,
+(iii)~diagnóstico de redundância e incerteza.
+Cada figura constitui uma \textit{prova} ou \textit{contraprova} de uma
+hipótese específica, detalhada a seguir.
+
+% ----------------------------------------------------------------------------
+\subsection{Caracterização do Target e Regimes Operacionais}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{reports/figures/01_evolucao_temporal_peso.png}
+    \caption{Série temporal do PESO DO FILTRO ao longo de 2025.}
+    \label{fig:01_temporal}
+\end{figure}
+
+A Figura~\ref{fig:01_temporal} evidencia a morfologia Gamma do target:
+baseline próximo a zero ($Q_{75} = \SI{0,050}{\gram}$) com picos
+esporádicos superiores a \SI{0,6}{\gram}. A assimetria positiva
+(média $= \SI{0,053}{\gram}$, mediana $= \SI{0,010}{\gram}$) e a
+presença de 11 eventos extremos ($> \SI{0,3}{\gram}$, apenas 3,5\%
+dos dias) justificam diretamente a adoção da Pseudo-Huber Loss em
+detrimento da MSE --- que penalizaria excessivamente esses picos e
+distorceria o aprendizado.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/02_bivariada_operacional.png}
+    \caption{Box plot condicional: peso do filtro por regime operacional
+             (\feature{is\_loading} = 0 vs.\ 1).}
+    \label{fig:02_bivariada}
+\end{figure}
+
+A Figura~\ref{fig:02_bivariada} compara a distribuição do peso do filtro
+entre dias com navio atracado (\feature{is\_loading} $= 1$) e dias sem
+operação de embarque (\feature{is\_loading} $= 0$). O teste de
+Mann-Whitney $U$ confirma diferença significativa ($p < 0{,}05$),
+validando a feature binária como discriminador legítimo de regime
+operacional. Dias com carregamento ativo apresentam mediana superior e
+maior dispersão --- consistente com a hipótese de que a movimentação
+portuária é fonte adicional de emissão.
+
+% ----------------------------------------------------------------------------
+\subsection{Validação das Hipóteses Físicas de Transporte}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{reports/figures/03_windrose_poluicao.png}
+    \caption{Windrose ponderada pelo peso do filtro.}
+    \label{fig:03_windrose}
+\end{figure}
+
+A Figura~\ref{fig:03_windrose} é a prova causal mais direta do projeto:
+a ``pétala'' predominante aponta na direção empresa$\to$praia, confirmando
+que o vento transporta material particulado da área de operação industrial
+para o ponto de coleta do filtro. Essa direcionalidade valida a geometria
+GPS utilizada no cálculo do \feature{fluxo\_efetivo} e demonstra que a
+decomposição vetorial ($u, v$) captura o mecanismo físico correto.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{reports/figures/03_chebyshev_outliers.png}
+    \caption{Detecção de anomalias via Desigualdade de Chebyshev ($k = 3$).}
+    \label{fig:03_chebyshev}
+\end{figure}
+
+A Figura~\ref{fig:03_chebyshev} aplica a Desigualdade de Chebyshev
+($k = 3$, distribution-free) para identificar eventos extremos.
+Os outliers detectados ($y > \mu + 3\sigma$) coincidem com dias de
+ventania intensa na direção empresa$\to$praia, confirmando que são
+\textit{fisicamente explicáveis} --- não erros de medição. Essa
+evidência justifica manter os extremos no dataset em vez de removê-los:
+são eventos raros mas reais que o modelo deve aprender a aproximar.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/04_cross_correlation.png}
+    \caption{Cross-correlation (CCF) entre Fluxo Efetivo e Peso do Filtro,
+             lags de 0 a 5 dias.}
+    \label{fig:04_ccf}
+\end{figure}
+
+A Figura~\ref{fig:04_ccf} revela o \textit{pico de correlação em lag~1}
+($r \approx 0{,}48$), com decaimento monotônico até lag~5. A interpretação
+física é inequívoca: a poeira emitida ontem deposita-se predominantemente
+hoje --- a ``memória'' do sistema de transporte e deposição gravitacional
+é de aproximadamente 24 horas. Esse resultado fundamenta a criação de
+\feature{fluxo\_efetivo\_lag1} como feature e explica por que ela
+consistentemente domina o Feature Importance de todos os modelos treinados.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/06_efeito_chuva.png}
+    \caption{Efeito washout: Fluxo Efetivo vs.\ Peso do Filtro,
+             colorido por \feature{is\_rainy}.}
+    \label{fig:06_chuva}
+\end{figure}
+
+A Figura~\ref{fig:06_chuva} confirma a hipótese de \textit{washout}:
+dias chuvosos com alta emissão apresentam peso do filtro \textbf{baixo}.
+A chuva ``lava'' as partículas em suspensão ou impede a ressuspensão do
+material depositado, agindo como regressor negativo. O teste de
+Mann-Whitney $U$ entre ``Alta Carga Seca'' e ``Alta Carga Úmida'' confirma
+significância ($p < 0{,}05$). Essa evidência justifica a inclusão
+obrigatória de \feature{precipitacao\_mm} e \feature{is\_rainy} no
+feature space, bem como a feature de interação
+$I = F_{\text{ef}} / (P_{\text{mm}} + 1)$.
+
+% ----------------------------------------------------------------------------
+\subsection{Diagnóstico de Redundância e Incerteza}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{reports/figures/05_pca_scree_plot.png}
+    \caption{Scree plot do PCA aplicado aos sensores de partículas (9m e 16m).}
+    \label{fig:05_pca}
+\end{figure}
+
+A Figura~\ref{fig:05_pca} demonstra que o primeiro componente principal
+(PC1) captura a maior parte da variância entre os sensores de partículas
+a diferentes alturas. A alta redundância implica que os sensores de 9m e
+16m medem essencialmente o mesmo fenômeno --- a ``poluição ambiental global''
+--- e que um componente principal é suficiente para representá-la. Esse
+diagnóstico justifica a decisão de não incluir todos os sensores como
+features independentes, evitando multicolinearidade no modelo.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/07_incerteza_coleta.png}
+    \caption{Volatilidade meteorológica na janela 08--09h vs.\ erro de predição.}
+    \label{fig:07_incerteza}
+\end{figure}
+
+A Figura~\ref{fig:07_incerteza} revela uma fonte de \textbf{ruído
+irredutível}: dias com alta volatilidade de vento e emissão na hora
+de coleta (08--09h) apresentam resíduos de predição sistematicamente
+maiores. A imprecisão de $\pm$1h na hora exata de troca do filtro é
+uma fonte de incerteza que nenhum modelo determinístico consegue
+eliminar. Esse diagnóstico aponta para modelos probabilísticos
+(e.g., Quantile Regression, Conformal Prediction) como evolução
+natural do pipeline.
+
+% ----------------------------------------------------------------------------
+\subsection{Diagnóstico dos Modelos (Figuras 8--15)}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{reports/figures/08_model_predictions_vs_actual.png}
+    \caption{XGBoost Baseline --- predições vs.\ valores reais ao longo do tempo.}
+    \label{fig:08_xgb_pred}
+\end{figure}
+
+A Figura~\ref{fig:08_xgb_pred} mostra que o XGBoost Baseline acompanha
+a tendência geral do target, com dificuldade nos picos extremos
+($> \SI{0,6}{\gram}$). A subestimação dos eventos extremos é esperada
+e desejável: a Pseudo-Huber Loss limita a influência dos resíduos
+extremos, priorizando a acurácia no regime dominante ($< \SI{0,05}{\gram}$).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/09_feature_importance.png}
+    \caption{Feature Importance (Gain) do XGBoost Baseline --- Top 15.}
+    \label{fig:09_importance}
+\end{figure}
+
+A Figura~\ref{fig:09_importance} confirma que a \textbf{física do
+transporte de partículas é capturada pelo modelo}:
+\feature{fluxo\_efetivo\_lag1} domina o ranking, seguida por features
+de vento ($u$, $v$), emissão e precipitação. Features de processo
+portuário (carregamento, H\textsubscript{2}O) também aparecem,
+confirmando a relevância operacional. A hierarquia é consistente com a
+cadeia causal: emissão $\to$ transporte eólico $\to$ deposição
+$\to$ supressão por chuva.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{reports/figures/10_tree_benchmark.png}
+    \caption{Benchmark de MAE: Random Forest vs.\ LightGBM vs.\ XGBoost.}
+    \label{fig:10_benchmark}
+\end{figure}
+
+A Figura~\ref{fig:10_benchmark} compara os três modelos baseados em
+árvores. O XGBoost com Pseudo-Huber Loss domina consistentemente em MAE.
+A superioridade sobre Random Forest (+7,5 pp) e LightGBM (+3,7 pp)
+deve-se à robustez da Huber Loss à cauda longa da distribuição Gamma
+--- modelos com MSE padrão são mais sensíveis aos outliers extremos.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{reports/figures/11_kan_predictions_vs_actual.png}
+    \caption{KAN $[39 \to 16 \to 1]$ --- predições vs.\ valores reais.}
+    \label{fig:11_kan_pred}
+\end{figure}
+
+A Figura~\ref{fig:11_kan_pred} ilustra a falha da KAN: a rede
+\textit{suaviza} os picos e \textit{diverge} nos extremos. O
+comportamento é típico de overfitting simultâneo ao underfitting:
+a rede memoriza o ``regime baixo'' (75\% dos dados $< \SI{0,05}{\gram}$)
+e falha completamente nos eventos extremos. A confirmação visual do
+diagnóstico de overparametrização (ratio 30:1 parâmetros:amostras).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{reports/figures/12_model_comparison_kan_vs_xgb.png}
+    \caption{Comparação lado a lado: KAN vs.\ XGBoost.}
+    \label{fig:12_comparison}
+\end{figure}
+
+A Figura~\ref{fig:12_comparison} expõe a divergência entre os modelos.
+O gap entre KAN e XGBoost \textit{cresce} nos eventos extremos:
+enquanto o XGBoost mantém erro relativamente constante, a KAN diverge
+exponencialmente. Esse padrão confirma que árvores de decisão com
+splits discretos são fundamentalmente mais adequadas que redes neurais
+com B-splines suaves para este cenário de small data com distribuição
+Gamma zero-inflated.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/13_optuna_optimization.png}
+    \caption{Histórico de otimização Optuna (100 trials, TPE Sampler).}
+    \label{fig:13_optuna}
+\end{figure}
+
+A Figura~\ref{fig:13_optuna} mostra convergência rápida nas primeiras
+20--30 trials, seguida de plateau. O melhor MAE encontrado
+(\SI{0,0501}{\gram}) é virtualmente idêntico ao baseline
+(\SI{0,0499}{\gram}), com diferença de apenas \SI{+0,0002}{\gram}.
+Essa evidência é a prova mais contundente da tese central:
+\textbf{engenharia de features domina tuning de hiperparâmetros}
+quando o feature space já captura a física do problema.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{reports/figures/14_optimized_predictions.png}
+    \caption{XGBoost Otimizado (pós-Optuna) --- predições vs.\ valores reais.}
+    \label{fig:14_opt_pred}
+\end{figure}
+
+A Figura~\ref{fig:14_opt_pred} demonstra performance visual
+equivalente ao baseline. Os picos $> \SI{0,6}{\gram}$ permanecem como
+fronteira de melhoria --- candidatos naturais a modelagem
+probabilística (Quantile Regression) ou detecção de regime em
+trabalhos futuros.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{reports/figures/15_optimized_feature_importance.png}
+    \caption{Feature Importance (Gain) do XGBoost Otimizado --- Top 15.}
+    \label{fig:15_opt_importance}
+\end{figure}
+
+A Figura~\ref{fig:15_opt_importance} confirma a \textbf{consistência
+estrutural} entre baseline e modelo otimizado: as mesmas features
+dominam em ambos (vento $u$, fluxo de emissão, precipitação, lags
+temporais). A otimização de hiperparâmetros não altera a estrutura
+do aprendizado --- apenas ajusta pesos marginalmente. A física
+capturada pelas features é robusta e estável.
+
+\newpage
+% ============================================================================
+% SEÇÃO 5: MODELAGEM PHYSICS-INFORMED
+% ============================================================================
+\section{Modelagem Physics-Informed}
+\label{sec:physics_model}
+
+Esta seção formaliza as features de engenharia física que constituem
+o diferencial do pipeline. Enquanto a Seção~\ref{sec:math} descreve
+a \textit{unificação temporal} (agregação multi-frequência), esta
+seção detalha a \textit{engenharia causal}: features derivadas da
+física do transporte atmosférico de partículas.
+
+% ----------------------------------------------------------------------------
+\subsection{Fluxo Efetivo --- Geometria Direcional}
+\label{subsec:fluxo_efetivo}
+
+O Fluxo Efetivo é a feature central do pipeline. Ele pondera a emissão
+de cada fonte industrial pela componente do vento na direção do ponto
+de coleta (praia):
+
+\begin{equation}
+    F_{\text{ef}} = \sum_{i=1}^{5} E_i \cdot \cos\!\left(
+        \theta_{\text{vento},i} - \theta_{\text{praia}}^{i}\right)
+    \label{eq:fluxo_efetivo}
+\end{equation}
+
+onde:
+\begin{itemize}[noitemsep]
+    \item $E_i$ = massa total emitida [\si{kg}] pela fonte $i$ na janela
+          de 24h (Eq.~\ref{eq:riemann});
+    \item $\theta_{\text{vento},i}$ = direção média do vento na RAMP $i$
+          [\si{rad}], calculada via $\text{arctan2}(-\bar{u}, -\bar{v})$;
+    \item $\theta_{\text{praia}}^{i}$ = ângulo geométrico fixo da fonte
+          $i$ até a praia [\si{rad}].
+\end{itemize}
+
+O ângulo fonte$\to$praia é calculado via coordenadas GPS de alta
+precisão:
+
+\begin{equation}
+    \theta_{\text{praia}}^{i} = \text{arctan2}\!\left(
+        \text{Lon}_{\text{praia}} - \text{Lon}_i,\;
+        \text{Lat}_{\text{praia}} - \text{Lat}_i
+    \right)
+    \label{eq:angulo_praia}
+\end{equation}
+
+com coordenadas fixas do ponto de coleta:
+$\text{Lat}_{\text{praia}} = -20{,}7957$,
+$\text{Lon}_{\text{praia}} = -40{,}5816$.
+
+\paragraph{Interpretação física.}
+O fator $\cos(\theta_v - \theta_p)$ é uma projeção vetorial:
+\begin{itemize}[noitemsep]
+    \item $\cos > 0$: vento transporta partículas \textit{da} fonte
+          \textit{para} a praia (contribuição positiva);
+    \item $\cos < 0$: vento afasta partículas da praia (contribuição
+          negativa --- efeito protetor);
+    \item $\cos \approx 0$: vento perpendicular à linha fonte-praia
+          (contribuição nula).
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\subsection{Interação Vento/Chuva --- Supressão por Washout}
+\label{subsec:interacao}
+
+A precipitação suprime a deposição de partículas via dois mecanismos:
+(i)~\textit{washout} --- gotas de chuva capturam partículas em
+suspensão, e (ii)~supressão de ressuspensão --- a umidade do solo
+impede que partículas já depositadas sejam levantadas novamente.
+A feature de interação normaliza o Fluxo Efetivo pelo efeito
+supressor:
+
+\begin{equation}
+    I_{\text{vc}} = \frac{F_{\text{ef}}}{P_{\text{mm}} + 1}
+    \label{eq:interacao}
+\end{equation}
+
+onde $P_{\text{mm}}$ é a precipitação acumulada na janela de 24h.
+A constante $+1$ no denominador garante estabilidade numérica e
+preserva a semântica: dias secos ($P = 0$) mantêm
+$I_{\text{vc}} = F_{\text{ef}}$; dias chuvosos reduzem $I_{\text{vc}}$
+proporcionalmente à intensidade da precipitação.
+
+% ----------------------------------------------------------------------------
+\subsection{Lags Temporais --- Causalidade Física}
+\label{subsec:lags}
+
+A deposição de partículas é um processo cumulativo com inércia temporal.
+A poeira emitida e transportada no dia $D-1$ pode continuar
+sedimentando sobre o filtro no dia $D$. Os lags capturam essa
+``memória'':
+
+\begin{equation}
+    \begin{aligned}
+        \feature{fluxo\_efetivo\_lag1} &= F_{\text{ef}}(D - 1) \\[3pt]
+        \feature{fluxo\_efetivo\_lag2} &= F_{\text{ef}}(D - 2) \\[3pt]
+        \feature{precipitacao\_lag1}   &= P_{\text{mm}}(D - 1)
+    \end{aligned}
+    \label{eq:lags}
+\end{equation}
+
+A correlação cruzada (Figura~\ref{fig:04_ccf}) confirma que o
+lag~1 do Fluxo Efetivo apresenta a maior correlação com o target
+($r \approx 0{,}48$), consistente com a escala temporal de deposição
+gravitacional de material particulado. O lag~2 captura efeitos
+residuais mais fracos, e o lag de precipitação modela o washout
+acumulado do dia anterior.
+
+% ----------------------------------------------------------------------------
+\subsection{Resumo das Features Engenheiradas}
+
+A Tabela~\ref{tab:features_eng} sintetiza as 4 features de engenharia
+física adicionadas à ABT.
+
+\begin{table}[H]
+\centering
+\caption{Features de engenharia física}
+\label{tab:features_eng}
+\begin{tabular}{@{}llp{6cm}@{}}
+\toprule
+\textbf{Feature} & \textbf{Tipo} & \textbf{Fundamento Físico} \\
+\midrule
+\feature{fluxo\_efetivo\_lag1} & Lag temporal &
+    Projeção direcional da emissão (dia anterior) ponderada
+    pelo cosseno do ângulo vento-praia. $r = 0{,}48$ com target. \\
+\feature{fluxo\_efetivo\_lag2} & Lag temporal &
+    Efeito residual de deposição de 2 dias (inércia do transporte). \\
+\feature{precipitacao\_lag1} & Lag temporal &
+    Supressão por washout acumulada no dia anterior. \\
+\feature{interacao\_vento\_chuva} & Interação &
+    Fluxo Efetivo normalizado pela precipitação.
+    Captura a competição vento vs.\ chuva. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A criação dos lags consume 2 linhas da ABT (lag2 requer 2 dias
+anteriores), resultando na dimensão final: $318 \to 316$ linhas
+$\times$ 33 colunas.
+
+\newpage
+% ============================================================================
+% SEÇÃO 6: BENCHMARK E DISCUSSÃO SOTA
+% ============================================================================
+\section{Benchmark e Discussão SOTA}
+\label{sec:benchmark}
+
+Esta seção apresenta o benchmark completo de 7 modelos, incluindo
+3 famílias de árvores (XGBoost, LightGBM, Random Forest), 2 redes
+neurais (KAN, MLP) e a otimização exaustiva via Optuna (100 trials).
+A validação utiliza \textbf{TimeSeriesSplit} com 5 folds e gap de 1
+dia para prevenir vazamento de informação dos lags temporais.
+
+% ----------------------------------------------------------------------------
+\subsection{Tabela Comparativa Completa}
+
+\begin{table}[H]
+\centering
+\caption{Benchmark completo --- 7 modelos avaliados por MAE e RMSE}
+\label{tab:benchmark}
+\begin{tabular}{@{}lS[table-format=1.4]S[table-format=1.4]rl@{}}
+\toprule
+\textbf{Modelo} &
+    {\textbf{MAE (g)}} &
+    {\textbf{RMSE (g)}} &
+    \textbf{Ganho vs.\ Dummy} &
+    \textbf{Parâmetros} \\
+\midrule
+Dummy (Média) &
+    0,0634 & {---} & {---} & {---} \\
+Random Forest &
+    0,0546 & 0,0884 & $+13{,}8\%$ & 500 árvores \\
+LightGBM (Huber) &
+    0,0522 & 0,0903 & $+17{,}6\%$ & {---} \\
+\textbf{XGBoost Baseline} &
+    \textbf{0,0499} & \textbf{0,0887} &
+    $\boldsymbol{+21{,}3\%}$ & \textbf{500 árvores} \\
+XGBoost Optuna &
+    0,0501 & 0,0891 & $+21{,}0\%$ & 900 árvores \\
+MLP $[39 \to 32 \to 16 \to 1]$ &
+    0,0643 & 0,1097 & $-1{,}4\%$ & 1.921 \\
+KAN $[39 \to 16 \to 1]$ &
+    0,0918 & 0,1561 & $-44{,}8\%$ & 9.578 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Métrica principal.} MAE (Erro Absoluto Médio) em gramas ---
+métrica natural para distribuições assimétricas com cauda longa.
+
+\paragraph{Protocolo de validação.} TimeSeriesSplit com 5 folds e
+gap $= 1$ dia. O gap previne que o lag1 do fold de treino vaze para
+o fold de teste.
+
+\paragraph{Função de perda.} \texttt{reg:pseudohubererror} para os
+modelos XGBoost --- robusta a outliers da cauda Gamma sem descartá-los.
+
+% ----------------------------------------------------------------------------
+\subsection{Por que o XGBoost Baseline Venceu}
+
+O XGBoost com Pseudo-Huber Loss emergiu como campeão por quatro razões
+estruturais:
+
+\begin{enumerate}
+    \item \textbf{Pseudo-Huber Loss.} Robusta a outliers
+          ($> \SI{1,0}{\gram}$) sem descartá-los. A distribuição Gamma
+          do target faz com que MSE penalize excessivamente os picos,
+          enquanto Huber Loss limita a influência dos resíduos extremos
+          mantendo diferenciabilidade.
+
+    \item \textbf{Tratamento nativo de NaN.} XGBoost aprende a direção
+          ótima dos splits quando encontra valores ausentes, sem
+          necessidade de imputação explícita. Os 29 NaN residuais em
+          \feature{classe\_filtro} são tratados automaticamente.
+
+    \item \textbf{Regularização intrínseca.} Árvores com profundidade
+          limitada (\texttt{max\_depth} $= 5$) e early stopping (50
+          rounds) evitam overfitting natural em small data (316 amostras).
+
+    \item \textbf{Splits discretos.} A natureza discreta dos splits de
+          árvore lida naturalmente com a distribuição zero-inflated do
+          target (75\% dos valores $< \SI{0,05}{\gram}$) e com switches
+          binários (\feature{is\_loading}, \feature{is\_rainy}).
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Optuna: Rendimento Decrescente do Tuning}
+
+O Optuna (100 trials, TPE Sampler) explorou o espaço de hiperparâmetros:
+
+\begin{table}[H]
+\centering
+\caption{Espaço de busca do Optuna}
+\label{tab:optuna_space}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Hiperparâmetro} & \textbf{Range} & \textbf{Escala} \\
+\midrule
+\texttt{max\_depth}        & $[3, 10]$       & Inteiro \\
+\texttt{learning\_rate}    & $[0{,}01;\; 0{,}3]$ & Log \\
+\texttt{n\_estimators}     & $[100, 1000]$   & Step = 50 \\
+\texttt{subsample}         & $[0{,}5;\; 1{,}0]$  & Linear \\
+\texttt{colsample\_bytree} & $[0{,}5;\; 1{,}0]$  & Linear \\
+\texttt{reg\_alpha}        & $[10^{-3}, 10]$   & Log \\
+\texttt{reg\_lambda}       & $[10^{-3}, 10]$   & Log \\
+\texttt{min\_child\_weight}& $[1, 10]$       & Inteiro \\
+\texttt{gamma}             & $[0{,}0;\; 1{,}0]$  & Linear \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O resultado: $\mae_{\text{Optuna}} = \SI{0,0501}{\gram}$ vs.\
+$\mae_{\text{Baseline}} = \SI{0,0499}{\gram}$ --- diferença de
+$+\SI{0,0002}{\gram}$, marginal e dentro do ruído estatístico
+(Figura~\ref{fig:13_optuna}).
+
+\paragraph{Interpretação.} Com 316 amostras e 33 features
+physics-informed, a engenharia de features já saturou a
+capacidade preditiva do paradigma de árvores de decisão. O tuning
+de hiperparâmetros opera sobre rendimentos marginais decrescentes
+quando o feature space captura adequadamente a física do problema.
+A recomendação prática é \textbf{investir em features antes de
+investir em tuning}.
+
+% ----------------------------------------------------------------------------
+\subsection{Diagnóstico da Falha Neural: KAN e MLP}
+
+\subsubsection{KAN $[39 \to 16 \to 1]$}
+
+A Kolmogorov-Arnold Network com 9.578 parâmetros (grid $= 3$, $k = 3$,
+B-splines) obteve $\mae = \SI{0,0918}{\gram}$ --- \textbf{44,8\% pior
+que o Dummy}. O diagnóstico identifica cinco causas:
+
+\begin{enumerate}
+    \item \textbf{Overparametrização crítica.} Ratio
+          parâmetros:amostras $= 9.578:316 \approx 30{:}1$.
+          O limiar recomendado para redes neurais é $> 100{:}1$,
+          idealmente $> 1.000{:}1$.
+
+    \item \textbf{Distribuição Gamma esparsa.} 75\% dos targets
+          $< \SI{0,05}{\gram}$, picos até \SI{1,05}{\gram}. Gradientes
+          instáveis: a rede converge para a ``média'' e ignora extremos.
+
+    \item \textbf{NaN handling.} Redes neurais exigem imputação
+          explícita de todos os NaN, que introduz viés. XGBoost trata
+          NaN nativamente via splits direcionais.
+
+    \item \textbf{Suavização excessiva.} KAN aprende funções suaves
+          (B-splines). A relação vento$\to$sujidade contém
+          descontinuidades (e.g., \feature{is\_loading} é um switch
+          binário), que XGBoost captura naturalmente via splits.
+
+    \item \textbf{Treinamento com Huber Loss ($\delta = 0{,}15$).}
+          O delta atenua outliers mas não resolve a instabilidade de
+          gradientes com $n$ tão pequeno.
+\end{enumerate}
+
+\subsubsection{MLP $[39 \to 32 \to 16 \to 1]$}
+
+O Multilayer Perceptron com 1.921 parâmetros (BatchNorm, GELU,
+Dropout) obteve $\mae = \SI{0,0643}{\gram}$ --- 1,4\% \textit{pior}
+que o Dummy. O ratio parâmetros:amostras de $\approx 6{:}1$ é
+superior ao da KAN, o que explica a falha menos severa, mas ainda
+insuficiente para generalização.
+
+\paragraph{Conclusão do diagnóstico neural.} Em regimes de Small Data
+com distribuição Gamma zero-inflated, modelos baseados em árvores
+de decisão são \textbf{estruturalmente superiores} a redes neurais.
+A superioridade não decorre de tuning --- decorre de propriedades
+intrínsecas: tratamento nativo de NaN, splits discretos para switches
+operacionais e regularização implícita por profundidade limitada.
+
+\newpage
+% ============================================================================
+% SEÇÃO 7: CONCLUSÃO E VIABILIDADE DE DEPLOY
+% ============================================================================
+\section{Conclusão e Viabilidade}
+\label{sec:conclusion}
+
+% ----------------------------------------------------------------------------
+\subsection{Síntese dos Resultados}
+
+Este trabalho demonstrou que a predição de deposição de material
+particulado em praia adjacente a operações de mineração e embarque
+portuário é viável com acurácia operacionalmente útil, sob as
+seguintes condições:
+
+\begin{enumerate}
+    \item \textbf{Compressão e unificação:} 687.220 registros brutos
+          (4 fontes, 3 frequências) foram unificados em uma ABT diária
+          de 316 linhas $\times$ 33 colunas, com taxa de compressão de
+          $\approx 2.176{:}1$ e zero nulos em features preditivas.
+
+    \item \textbf{Engenharia física > complexidade algorítmica:}
+          O XGBoost Baseline com 33 features physics-informed e
+          Pseudo-Huber Loss atingiu $\mae = \SI{0,0499}{\gram}$
+          ($-21{,}3\%$ vs.\ Dummy), sem necessidade de tuning
+          exaustivo (Optuna $\mae = \SI{0,0501}{\gram}$, ganho nulo).
+
+    \item \textbf{Feature dominante:} \feature{fluxo\_efetivo\_lag1}
+          ($r = 0{,}48$ com o target) --- a projeção direcional
+          vento-emissão do dia anterior --- é o preditor mais
+          importante em todos os modelos, consistente com a física de
+          deposição gravitacional (memória $\approx$ 24h).
+
+    \item \textbf{Redes neurais inviáveis:} KAN ($-44{,}8\%$) e MLP
+          ($-1{,}4\%$) falharam devido a overparametrização em Small
+          Data. O ratio parâmetros:amostras é o gargalo, não a
+          arquitetura.
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Viabilidade de Deploy}
+
+O modelo campeão (XGBoost Baseline) é \textbf{viável para deploy
+operacional} pelas seguintes razões:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Latência:} inferência $< \SI{1}{\milli\second}$
+          por amostra (CPU);
+    \item \textbf{Formato:} modelo serializado em JSON
+          (\arquivo{models/xgb\_baseline.json}), compatível com
+          qualquer runtime XGBoost;
+    \item \textbf{Dependências:} apenas \texttt{xgboost},
+          \texttt{pandas} e \texttt{numpy} --- stack mínima;
+    \item \textbf{Monitoramento:} Feature Importance estável entre
+          baseline e otimizado --- o modelo é robusto a re-treinamento;
+    \item \textbf{Reprodutibilidade:} pipeline completo
+          (ETL $\to$ Features $\to$ Treino $\to$ Avaliação) versionado
+          com DVC e Git.
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\subsection{Limitações Conhecidas}
+
+\begin{enumerate}
+    \item \textbf{Eventos extremos ($> \SI{0,3}{\gram}$):} O modelo
+          subestima sistematicamente os picos (11 dias, 3,5\% do
+          dataset). A Pseudo-Huber Loss atenua mas não elimina o viés.
+
+    \item \textbf{Incerteza na hora de coleta:} A imprecisão de
+          $\pm$1h na troca do filtro (08--09h) é fonte de ruído
+          irredutível (Figura~\ref{fig:07_incerteza}).
+
+    \item \textbf{Small Data:} 316 amostras limitam a complexidade
+          máxima dos modelos e impedem validação por holdout robusto.
+
+    \item \textbf{Estacionariedade:} O modelo assume que a relação
+          emissão-transporte-deposição é estacionária ao longo de 2025.
+          Mudanças operacionais (novos equipamentos, rotas de navio)
+          podem invalidar o modelo.
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Próximos Passos}
+
+\begin{enumerate}
+    \item \textbf{Quantile Regression:} Substituir a predição pontual
+          por intervalos de confiança ($q_{10}$, $q_{50}$, $q_{90}$)
+          para capturar a incerteza inerente ao sistema.
+
+    \item \textbf{Conformal Prediction:} Calibração de intervalos com
+          garantia de cobertura marginal, sem suposições
+          distribucionais.
+
+    \item \textbf{Detecção de regime:} Modelo hierárquico com
+          classificador binário (evento normal vs.\ extremo) seguido
+          de regressores especializados por regime.
+
+    \item \textbf{Dados adicionais:} Incorporar imagens de satélite
+          (MODIS AOD) e previsões meteorológicas (NWP) para ampliar o
+          feature space sem depender de sensores locais.
+
+    \item \textbf{Monitoramento em produção:} Implementar drift
+          detection (PSI, KS-test) nas features de entrada e no
+          target para alertas automáticos de degradação do modelo.
+\end{enumerate}
+
+\end{document}
