@@ -1,12 +1,11 @@
 # Contexto do Projeto: Predição de Sujidade em Praia (Mineração) - SOTA Architecture
 
-
 ## 0. Infraestrutura & Workflow (DevContainer + DVC + GitFlow)
 
 **ATENÇÃO CLAUDE:** Este projeto roda em um ambiente estrito de MLOps. Antes de executar qualquer código ou sugerir alterações, você deve entender o estado atual do repositório.
 
 ### A. Estrutura de Arquivos (Project Tree)
-
+```text
 projeto-ml-sota/
 │
 ├── .devcontainer/       # Config do Docker (Python 3.11 + GPU)
@@ -45,24 +44,29 @@ projeto-ml-sota/
 ├── poetry.lock          # Dependências Python (Lockfile)
 ├── pyproject.toml       # Configuração do Poetry
 └── README.md
+```
 
+### B. Regras de Versionamento (GitFlow & DVC)
+1.  **Estado Atual:**
+    * Estamos na branch `develop` (ou feature branch).
+    * Último Commit: `chore: Configuração/Build Inicial` (Autor: Jorge Metri).
+    * **Dados Raw:** O usuário irá adicionar os arquivos CSV brutos em `data/raw/` manualmente. Não tente baixar ou criar dados dummy a menos que solicitado.
+2.  **Fluxo de Trabalho Obrigatório:**
+    * **Código (`src/`, `conf/`):** Versionado pelo **Git**.
+    * **Dados (`data/`) e Modelos (`models/`):** Versionados pelo **DVC**.
+    * **Dependências:** Gerenciadas via **Poetry**. Nunca use `pip install` direto; use `poetry add`.
+3.  **Comandos Permitidos:**
+    * Ao gerar um novo dataset processado: `dvc add data/processed/abt_master.parquet`.
+    * Ao criar scripts: `git add src/...`.
+    * Para rodar pipelines: `dvc repro`.
 
-
-
-
-
-
-
-
-
-
-
-
-
+---
 
 ## 1. Objetivo de Negócio
 Prever a variável contínua `PESO DO FILTRO` (acumulado 24h) integrando dados meteorológicos de alta frequência (RAMPs), emissões calculadas de fluxo (Polígonos) e dados de processo portuário (Carregamento).
-O modelo deve distinguir com precisão entre poeira gerada por operação ativa (Navio) vs. erosão eólica passiva (Pátio), lidando robustamente com a esparsidade dos dados operacionais.
+O modelo deve distinguir com precisão entre poeira gerada por operação ativa (Navio) vs. erosão eólica passiva (Pátio), lidando robustamente com a esparsidade dos dados operacionais e incertezas de coleta.
+
+---
 
 ## 2. Estratégia de ETL (Data Cleaning & Casting)
 
@@ -131,16 +135,21 @@ Iterar sobre cada `Data` válida do Target ($D$, coleta às 09:00):
         * Soma de Toneladas (`Carregamento_Total`).
         * Moda do Produto (ou 'NO_OP').
         * Média de H2O (usando os valores imputados).
+    * **CHUVA (Nova Agregação):** Soma de precipitação (se houver sensor) ou média de H2O (proxy).
 3.  **Features Geométricas (Física):**
-    * Calcular $\theta_{praia}$ (ângulo RAMP->Praia) usando `arctan2(delta_lon, delta_lat)`.
-    * Calcular `Fluxo_Efetivo = Emissao_Total * cos(Vento_Medio - Theta_Praia)`.
+    * **Input:** Dicionário de coordenadas fixas (SOTA Precision).
+        * **Praia (Target):** Lat **-20.7956661**, Lon **-40.5816175** (Ref: Ponto exato de coleta).
+        * **RAMPs:** Lat/Lon extraídas do dicionário de configuração.
+    * **Cálculo:**
+        * Para cada RAMP $i$: Calcular $\theta_{praia}^i = \text{arctan2}(Lon_{praia}-Lon_i, Lat_{praia}-Lat_i)$.
+        * `Fluxo_Efetivo` = $\sum (\text{Emissao}_i \times \cos(\text{Vento}_i - \theta_{praia}^i))$.
 4.  **Output:** ABT Diária (`data/processed/abt_master.parquet`).
 
 ---
 
-## 4. Estratégia de EDA (Robust Statistics)
+## 4. Estratégia de EDA (Robust Statistics & Physical Validation)
 
-O EDA deve validar a física e a estatística dos dados unificados. Ordem de execução:
+O EDA deve validar a física, a estatística e as **inconsistências de coleta**. Ordem de execução:
 
 ### Passo 1: Análise Univariada & Temporal
 * **Line Chart:** Evolução do `PESO DO FILTRO` no tempo.
@@ -165,38 +174,88 @@ O EDA deve validar a física e a estatística dos dados unificados. Ordem de exe
 * **Objetivo:** Investigar redundância entre as alturas das RAMPs (9m, 16m, TSP).
 * **Ação:** Padronizar -> PCA -> Scree Plot. Se PC1 explicar >90%, usar PC1 como proxy de poluição ambiental.
 
+### Passo 6: Análise de "Washout" (Efeito da Chuva) - **NOVO**
+* **Contexto:** A chuva pode "lavar" o filtro ou impedir a ressuspensão de poeira, gerando um peso artificialmente baixo mesmo com operação alta.
+* **Ação:**
+    * Criar feature `is_rainy` (Binária: chuva > limiar ou H20 > P75).
+    * **Scatter Plot Colorido:** Eixo X: `Fluxo_Efetivo`, Eixo Y: `PESO DO FILTRO`, Cor: `is_rainy`.
+    * **Hipótese:** Esperamos ver pontos de "Alta Emissão" mas "Baixo Peso" quando `is_rainy == True`.
+    * **Teste de Robustez:** Aplicar **Mann-Whitney U** comparando o Peso em dias de "Alta Carga Seca" vs "Alta Carga Úmida". Se houver diferença significativa, a chuva é um regressor negativo obrigatório.
+
+### Passo 7: Sensibilidade da Janela de Coleta (08:00 vs 09:00) - **NOVO**
+* **Contexto:** A coleta ocorre entre 08:00 e 09:00, mas a unificação assume 09:00 fixo. Isso cria uma incerteza de 1 hora.
+* **Ação:**
+    * Calcular a variância (Std Dev) do Vento e Emissão especificamente na janela horária `08:00 - 09:00` de todos os dias.
+    * **Plot:** Plotar `StdDev_Hora_Coleta` vs `Erro_Predicao` (Resíduo do Baseline).
+    * **Hipótese:** Se os dias com alta volatilidade nessa hora tiverem maior erro no modelo, a imprecisão da coleta é a causa. Isso justifica o uso de modelos probabilísticos (que preveem um intervalo de confiança) em vez de determinísticos.
+
 ---
 
-## 5. Estratégia de Modelagem (SOTA & Foundation Models)
+## 5. Estratégia de Modelagem (SOTA & Physics-Informed)
 
-A modelagem deve comparar abordagens clássicas, de ensemble e Deep Learning moderno.
+A modelagem deve priorizar robustez a outliers (distribuição Gamma) e causalidade temporal (Lags).
 
-### A. Validação
-* **Método:** `TimeSeriesSplit` (5 Folds).
-* **Restrição:** Proibido `Shuffle=True`. O treino deve ser sempre no passado do teste para evitar Data Leakage temporal.
+### A. Preparação de Features (Pré-Treino)
+Antes de entrar no modelo, o script de treino deve gerar:
+1.  **Lags Físicos (Crucial):**
+    * `fluxo_efetivo_lag1` (O maior preditor segundo a EDA: r=0.48).
+    * `fluxo_efetivo_lag2`.
+    * `precipitacao_lag1` (A chuva de ontem afeta a poeira de hoje?).
+2.  **Interaction Features:**
+    * `interacao_vento_chuva` = `fluxo_efetivo` / (`precipitacao_mm` + 1).
 
-### B. Modelos Tabulares (Baselines & SOTA)
-1.  **Random Forest & Bagging:** Baseline robusto para entender a importância das features.
-2.  **XGBoost / Gradient Boosting:** O estado da arte para dados tabulares com nulos. Lida nativamente com a flag `is_loading` e a não-linearidade do vento.
-3.  **MLP (Multi-Layer Perceptron):** Rede neural densa simples como benchmark de Deep Learning.
-4.  **KAN (Kolmogorov-Arnold Network):**
-    * **Por que usar:** KANs modelam funções univariadas complexas (splines) nas arestas. Ideal para capturar a física exata da dispersão ($Vento^3$) sem precisar de feature engineering manual excessivo.
+### B. Configuração dos Modelos (Huber Loss Mandatório)
+Devido à cauda longa (Outliers > 1.0g) e distribuição Gamma:
 
-### C. Foundation Models de Série Temporal (Experimental)
-* **Modelo:** **TimesFM (Google)** ou **Chronos**.
-* **Discussão:**
-    * Métodos clássicos (ARIMA) sofrem com regressores exógenos complexos (Vento, Navio).
-    * Foundation Models pré-treinados em bilhões de pontos de dados podem capturar padrões sazonais e tendências melhor que modelos treinados do zero, especialmente com dataset pequeno (< 1 ano).
-    * **Ação:** Usar TimesFM em modo *zero-shot* ou *fine-tuning* leve, passando as features exógenas (Vento, Carregamento) como contexto.
+1.  **Baseline: XGBoost Regressor**
+    * **Objective:** `reg:pseudohubererror` (ou `reg:gamma`).
+    * **Eval Metric:** `mae` (para monitoramento) e `rmse` (para penalização).
+    * **Handling Nulos:** O XGBoost lida nativamente, mas garantir que `is_loading` esteja presente.
 
-### D. Métricas de Sucesso
-* **RMSE (Root Mean Squared Error):** Penaliza grandes erros (anomalias).
-* **MAE (Mean Absolute Error):** Erro médio real em gramas.
-* **R² Ajustado:** Quanto da variância da sujeira é explicada pelo modelo.
+2.  **SOTA: KAN (Kolmogorov-Arnold Network) / MLP**
+    * **Loss Function:** `torch.nn.HuberLoss(delta=0.15)` (Delta baseado na mediana dos resíduos da EDA).
+    * **Arquitetura:** Input -> [Lags + Física] -> KAN Layer -> Output (Relu para garantir não-negatividade).
+
+### C. Estratégia de Validação
+* **Split:** `TimeSeriesSplit` (5 Folds).
+* **Gap:** Deixar 1 dia de gap entre treino e teste para evitar vazamento de lag.
+* **Métrica de Sucesso Principal:** **MAE** (Erro Absoluto Médio) em gramas.
+* **Check de Robustez:** O modelo deve errar menos nos dias de pico (Outliers) do que um modelo dummy (média).
+
+### D. Artefatos de Saída
+* Script `src/features/build_features_final.py` (Gera lags).
+* Script `src/models/train_model.py` (Treina e loga métricas).
+* Plot `reports/figures/08_model_predictions_vs_actual.png`.
+* Plot `reports/figures/09_feature_importance.png` (Verificar se Lag1 está no topo).
 
 ---
 
 ## 6. Comandos Iniciais para o Claude Code
 1.  Execute a FASE 1 (ETL) seguindo estritamente as regras de limpeza de strings e imputação.
 2.  Gere a ABT em `data/processed/`.
-3.  Execute a FASE 2 (EDA) gerando os gráficos e o relatório de anomalias de Chebyshev.
+3.  Execute a FASE 2 (EDA) gerando os gráficos, o relatório de anomalias de Chebyshev e os testes de hipótese de Washout.
+
+## 7. Fase 3.D: Fine-Tuning & Otimização (Optuna)
+
+**Objetivo:** Minimizar o MAE através da busca exaustiva de hiperparâmetros.
+
+* **Script:** `src/models/tune_xgboost.py`.
+* **Motor de Busca:** **Optuna** (100 trials).
+* **Espaço de Busca:**
+    * `max_depth`: [3, 10]
+    * `learning_rate`: [0.01, 0.3]
+    * `n_estimators`: [100, 1000]
+    * `subsample` & `colsample_bytree`: [0.5, 1.0]
+* **Regras de Ouro:**
+    * Manter `objective='reg:pseudohubererror'`.
+    * Validação cruzada obrigatória: `TimeSeriesSplit(n_splits=5, gap=1)`.
+    * Salvar o melhor modelo em `models/xgb_optimized.json`.
+
+## 8. Fase 4: Comunicação Técnica (Beamer Presentation)
+
+**Objetivo:** Consolidar o workflow MLOps e os resultados finais.
+
+* **Arquivo:** `reports/paper/presentation.tex`.
+* **Conteúdo:** * Slides de infraestrutura, ETL e EDA.
+    * Comparativo de modelos (XGBoost Baseline vs. Optimized vs. MLP vs. KAN).
+    * Gráficos de importância de features e predição vs. real.

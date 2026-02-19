@@ -1,0 +1,5 @@
+outs:
+- md5: 1d61c0b645ee00debb076587ca6bee61
+  size: 119432
+  hash: md5
+  path: xgb_optimized.json
