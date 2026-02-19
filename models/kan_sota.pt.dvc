@@ -1,0 +1,5 @@
+outs:
+- md5: eb0121b88fc5467047e065cb83a36487
+  size: 179837
+  hash: md5
+  path: kan_sota.pt

@@ -1,0 +1,5 @@
+outs:
+- md5: 64685b70259d1c0f22a5190469a921e5
+  size: 16265
+  hash: md5
+  path: mlp_sota.pt

@@ -2,6 +2,7 @@
 	"name": "Python 3",
 	"image": "python:3.11-bookworm",
 	"runArgs": [
-    "--gpus", "all"
-]
+		"--gpus", "all"
+	],
+	"postCreateCommand": "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs"
 }
